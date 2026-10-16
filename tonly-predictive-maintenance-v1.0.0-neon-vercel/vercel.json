@@ -1,0 +1,9 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "functions": {
+    "api/ml_compute.py": {
+      "maxDuration": 60,
+      "includeFiles": "ml_core.py"
+    }
+  }
+}
