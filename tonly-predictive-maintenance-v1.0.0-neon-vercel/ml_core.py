@@ -16,11 +16,13 @@ import numpy as np
 from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 from sklearn.ensemble import RandomForestRegressor
+from sklearn.linear_model import LinearRegression
+from sklearn.linear_model import RANSACRegressor
 from sklearn.metrics import mean_absolute_error
 from xgboost import XGBRegressor
 
-APP_VERSION = "1.0.0"
-MODEL_VERSION = "tonly-usage-rf-xgb-v1.0.0"
+APP_VERSION = "1.0.1"
+MODEL_VERSION = "tonly-ransac-rf-xgb-v1.1.0"
 FEATURE_NAMES = [
     "rate_current", "rate_lag_1", "rate_lag_2", "rate_median_7",
     "rate_mean_7", "rate_std_7", "elapsed_days", "weekday", "month",
@@ -34,7 +36,7 @@ MAX_COLUMNS = 100
 app = FastAPI(
     title="TONLY Predictive Maintenance ML API",
     version=APP_VERSION,
-    description="Usage-rate forecasting with Random Forest and XGBoost; approved PM rules remain authoritative.",
+    description="RANSAC-based odometer outlier screening followed by usage-rate forecasting with Random Forest and XGBoost; approved PM rules remain authoritative.",
 )
 
 
@@ -164,6 +166,70 @@ def _extract_daily(rows: list[dict[str, Any]], headers: list[str], today: date) 
             output[truck] = daily_points
             stats["validDailyReadings"] += len(daily_points)
     return output, stats
+
+
+def _ransac_filter_daily(
+    points_by_truck: dict[str, list[Observation]],
+) -> tuple[dict[str, list[Observation]], int, int, set[str]]:
+    """Screen per-truck odometer-vs-date outliers with RANSAC before rate modelling.
+
+    RANSAC is a screening stage, not a correction engine: flagged source readings are
+    excluded from model features but are never overwritten. Short histories bypass this
+    stage and continue through the existing conservative interval validation.
+    """
+    cleaned: dict[str, list[Observation]] = {}
+    outlier_count = 0
+    applied_trucks = 0
+    latest_flagged: set[str] = set()
+
+    for truck, points in points_by_truck.items():
+        ordered = sorted(points, key=lambda point: (point.day, point.row_index))
+        if len(ordered) < 12:
+            cleaned[truck] = ordered
+            continue
+
+        x = np.asarray([(point.day - ordered[0].day).days for point in ordered], dtype=float).reshape(-1, 1)
+        y = np.asarray([point.odometer for point in ordered], dtype=float)
+        positive_rates = [
+            (ordered[i].odometer - ordered[i - 1].odometer) / (ordered[i].day - ordered[i - 1].day).days
+            for i in range(1, len(ordered))
+            if (ordered[i].day - ordered[i - 1].day).days > 0
+            and ordered[i].odometer >= ordered[i - 1].odometer
+        ]
+        typical_rate = float(median(positive_rates)) if positive_rates else 0.0
+        # Tolerance reflects several typical operating days and has a floor for normal
+        # operational variability; this deliberately avoids overreacting to small drift.
+        residual_threshold = max(1200.0, typical_rate * 5.0)
+        try:
+            model = RANSACRegressor(
+                estimator=LinearRegression(),
+                min_samples=max(2, int(math.ceil(len(ordered) * 0.6))),
+                residual_threshold=residual_threshold,
+                max_trials=100,
+                random_state=42,
+            )
+            model.fit(x, y)
+            inlier_mask = np.asarray(model.inlier_mask_, dtype=bool)
+            if inlier_mask.shape[0] != len(ordered) or int(inlier_mask.sum()) < max(8, int(len(ordered) * 0.5)):
+                # If the dominant trend is not stable enough, do not let RANSAC discard
+                # a large portion of the truck's history; fallback to the rate validator.
+                cleaned[truck] = ordered
+                continue
+            applied_trucks += 1
+            kept: list[Observation] = []
+            for point, is_inlier in zip(ordered, inlier_mask):
+                if is_inlier:
+                    kept.append(point)
+                else:
+                    outlier_count += 1
+                    if point is ordered[-1]:
+                        latest_flagged.add(truck)
+            cleaned[truck] = kept
+        except (ValueError, TypeError, FloatingPointError):
+            # Fail open to the existing interval-level validation if a fit cannot be made.
+            cleaned[truck] = ordered
+
+    return cleaned, outlier_count, applied_trucks, latest_flagged
 
 
 def _robust_rate_upper(history: list[float]) -> float | None:
@@ -402,14 +468,22 @@ def forecast_payload(payload: ForecastRequest, today: date | None = None) -> dic
     if payload.serviceOdometer is not None and payload.serviceOdometer < 0:
         raise HTTPException(status_code=422, detail="serviceOdometer cannot be negative.")
 
-    all_points, data_quality = _extract_daily(payload.rows, payload.headers, today)
-    if payload.truckId not in all_points or len(all_points[payload.truckId]) < 2:
+    raw_points, data_quality = _extract_daily(payload.rows, payload.headers, today)
+    if payload.truckId not in raw_points or len(raw_points[payload.truckId]) < 2:
         raise HTTPException(status_code=422, detail=f"No usable dated odometer history was found for {payload.truckId}.")
+    all_points, ransac_outliers, ransac_trucks, ransac_latest_flagged = _ransac_filter_daily(raw_points)
+    data_quality["ransacOutliers"] = ransac_outliers
+    data_quality["ransacAppliedTrucks"] = ransac_trucks
+    data_quality["ransacLatestFlagged"] = int(payload.truckId in ransac_latest_flagged)
+    if payload.truckId in ransac_latest_flagged:
+        raise HTTPException(status_code=422, detail="RANSAC flagged the latest odometer reading as inconsistent with this truck's date-to-odometer trend. Review the source row before forecasting; the reading has not been corrected automatically.")
+    if payload.truckId not in all_points or len(all_points[payload.truckId]) < 2:
+        raise HTTPException(status_code=422, detail=f"RANSAC screening left insufficient dated odometer history for {payload.truckId}; review the source records.")
     all_intervals, usage_rate_outliers, accepted_anchors = _build_clean_intervals(all_points)
     data_quality["usageRateOutliers"] = usage_rate_outliers
     target_points = all_points[payload.truckId]
     target_intervals = all_intervals.get(payload.truckId, [])
-    latest_source_point = target_points[-1]
+    latest_source_point = raw_points[payload.truckId][-1]
     latest = accepted_anchors.get(payload.truckId, target_points[0])
     if latest_source_point.day > latest.day:
         raise HTTPException(status_code=422, detail="The latest source reading is an implausible odometer-usage jump relative to the prior accepted history. Review the truck's source records before forecasting.")
@@ -476,8 +550,10 @@ def forecast_payload(payload: ForecastRequest, today: date | None = None) -> dic
         "training": training,
         "models": forecasts,
         "notes": [
+            "RANSAC screens per-truck date-to-odometer trends before robust interval validation; flagged readings are excluded from modelling, never silently corrected in the source.",
             "Random Forest and XGBoost estimate future odometer usage, not component failures.",
             "Validation uses a chronological holdout and reports MAE in km/day; results must be compared with the median baseline.",
+            "RANSAC is skipped for histories shorter than 12 daily points; the existing conservative interval checks still apply.",
             "Approved PM kilometre and calendar rules remain authoritative. Forecasts are provisional.",
         ],
     }
