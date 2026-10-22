@@ -738,7 +738,7 @@ export default function Dashboard() {
       return;
     }
     setMlLoading(true);
-    setMlMessage("Training and evaluating Random Forest and XGBoost against a chronological holdout…");
+    setMlMessage("Screening odometer trends with RANSAC, then training and evaluating Random Forest and XGBoost…");
     setMlComparison(null);
     setForecastMethod("rule_based");
     try {
@@ -765,7 +765,7 @@ export default function Dashboard() {
       setMlComparison(result as MLComparisonResult);
       const training = result.training as MLComparisonResult["training"];
       if (training?.status === "trained") {
-        setMlMessage(`Training complete: ${training.trainingExamples} historical next-interval examples; ${training.testExamples} held-out examples evaluated. ${Number(result.dataQuality?.usageRateOutliers ?? 0)} implausible odometer-usage jumps were excluded. Only models that beat the median baseline can be selected.`);
+        setMlMessage(`RANSAC screening complete: ${Number(result.dataQuality?.ransacOutliers ?? 0)} trend outlier(s) flagged across ${Number(result.dataQuality?.ransacAppliedTrucks ?? 0)} truck(s); ${Number(result.dataQuality?.usageRateOutliers ?? 0)} additional implausible usage interval(s) excluded. Trained on ${training.trainingExamples} historical examples and evaluated ${training.testExamples} later holdout examples. Only models that beat the median baseline can be selected.`);
       } else {
         setMlMessage(training?.reason || "Not enough valid historical examples to train the ML models. The rule-based estimate remains available.");
       }
@@ -1102,8 +1102,8 @@ export default function Dashboard() {
                 <div className="forecast-save-controls"><button className="button primary" onClick={saveForecast} disabled={!plannerSignedIn || selectedForecast.status !== "ready" || selectedUsageRate === null || selectedUsageRate <= 0 || (forecastMethod !== "rule_based" && !mlComparison?.modelRunId) || forecastSaveLoading || !ruleSourceReferenceInput.trim() || !serviceEvidenceReferenceInput.trim() || !approvalConfirmed}>{forecastSaveLoading ? <RefreshCw size={14} className="spin" /> : <Database size={14} />}{forecastSaveLoading ? "Saving forecast…" : "Save provisional forecast"}</button>{!plannerSignedIn && <span>Sign in on Data Quality to save a forecast.</span>}{forecastSaveMessage && <p role="status" aria-live="polite">{forecastSaveMessage}</p>}</div>
               </div>
               <section className="panel ml-comparison-panel">
-                <div className="panel-header"><div><h2>Machine-learning comparison</h2><p>Train Random Forest and XGBoost on real historical odometer intervals; validate on later dates.</p></div><BrainCircuit size={20} className="model-head-icon" /></div>
-                <p className="prediction-method-note">The models forecast future usage in km/day. They do not predict component failures. A chronological holdout is used to compare each model's MAE against a median-rate baseline.</p>
+                <div className="panel-header"><div><h2>Machine-learning comparison</h2><p>RANSAC screens odometer trends first; Random Forest and XGBoost are then trained on validated intervals and evaluated on later dates.</p></div><BrainCircuit size={20} className="model-head-icon" /></div>
+                <p className="prediction-method-note">RANSAC flags readings that deviate from each truck's date-to-odometer trend; flagged values are excluded from modelling, never overwritten in the source. Random Forest and XGBoost forecast future usage in km/day, not component failures. A chronological holdout compares each model's MAE against a median-rate baseline.</p>
                 <div className="ml-actions"><button className="button primary" onClick={runMlComparison} disabled={mlLoading || !plannerSignedIn || !importRows.length || !effectivePredictionTruckId}>{mlLoading ? <RefreshCw size={14} className="spin" /> : <BrainCircuit size={14} />}{mlLoading ? "Training models…" : "Run Random Forest + XGBoost"}</button>{!plannerSignedIn && <span>Sign in on Data Quality first.</span>}</div>
                 {mlMessage && <div className="import-message" role="status" aria-live="polite"><CircleDot size={15} /><span>{mlMessage}</span></div>}
                 {mlComparison && <>
