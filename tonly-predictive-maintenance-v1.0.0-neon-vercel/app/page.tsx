@@ -261,6 +261,7 @@ type LiveUsage = {
   validDailyReadings: number;
   usageRateOutliers: number;
   suspiciousLatestReading: boolean;
+  suspectReading: { sourceRow: number; recordNumber: string | null; date: string; odometer: number; previousDate: string | null; previousOdometer: number | null; comparisonDate: string | null; comparisonOdometer: number | null; reason: string } | null;
 };
 
 type MLForecastItem = {
@@ -310,7 +311,8 @@ function estimateUsage(rows: Record<string, unknown>[], headers: string[], truck
   const idCol = getColumn(headers, [/^vehicle number$/i, /^truck.?id$/i, /^vehicle$/i, /vehicle number|truck.?id|truck|车辆编号/i]);
   const dateCol = getColumn(headers, [/^date$/i, /^date\s*\(.*\)$/i, /date.?time/i, /observed.?at/i, /日期/i]);
   const odoCol = getColumn(headers, [/^kilomet(?:er|re)s?$/i, /^odometer(?:_km)?$/i, /kilomet|odometer|公里数|里程/i]);
-  const empty: LiveUsage = { truckId, latestOdometer: null, latestDate: null, averageKmPerDay: null, intervalsUsed: 0, validDailyReadings: 0, usageRateOutliers: 0, suspiciousLatestReading: false };
+  const recordCol = getColumn(headers, [/^record number$/i, /^record.?id$/i, /^serial(?: number)?$/i]);
+  const empty: LiveUsage = { truckId, latestOdometer: null, latestDate: null, averageKmPerDay: null, intervalsUsed: 0, validDailyReadings: 0, usageRateOutliers: 0, suspiciousLatestReading: false, suspectReading: null };
   if (!idCol || !dateCol || !odoCol || !truckId) return empty;
   const todayEnd = new Date(); todayEnd.setHours(23, 59, 59, 999);
   const parsed = rows.map((row, index) => {
@@ -319,7 +321,8 @@ function estimateUsage(rows: Record<string, unknown>[], headers: string[], truck
     const rawOdo = row[odoCol];
     const textOdo = String(rawOdo ?? "").replace(/,/g, "").trim();
     const odo = textOdo === "" ? NaN : (typeof rawOdo === "number" ? rawOdo : Number(textOdo));
-    return { id, timestamp, odo, index };
+    const sourceRowValue = Number(row.__sourceRow);
+    return { id, timestamp, odo, index, sourceRow: Number.isInteger(sourceRowValue) && sourceRowValue >= 2 ? sourceRowValue : index + 2, recordNumber: recordCol && row[recordCol] !== undefined && row[recordCol] !== null && String(row[recordCol]).trim() !== "" ? String(row[recordCol]).trim() : null };
   }).filter(r => r.id === truckId && /^ET\d{3}$/.test(r.id) && Number.isFinite(r.timestamp)
       && r.timestamp <= todayEnd.getTime() && Number.isFinite(r.odo) && r.odo >= 0)
     .sort((a, b) => a.timestamp - b.timestamp || a.index - b.index);
@@ -334,11 +337,27 @@ function estimateUsage(rows: Record<string, unknown>[], headers: string[], truck
   }
   const latestSourceCandidate = parsed[parsed.length - 1];
   const latestSourceCandidateRejected = Boolean(latestSourceCandidate && !accepted.some(row => row.index === latestSourceCandidate.index));
-  // One reading per calendar day, using the last accepted reading on that day.
-  const byDay = new Map<string, { day: string; timestamp: number; odo: number }>();
+  const priorAcceptedToLatest = accepted[accepted.length - 1];
+  let suspectReading: LiveUsage["suspectReading"] = null;
+  if (latestSourceCandidateRejected && latestSourceCandidate && priorAcceptedToLatest) {
+    // A backwards reading can mean either that the new value is wrong or that the preceding high value was a jump.
+    // Point reviewers to the preceding accepted value that caused subsequent readings to be rejected, and show the
+    // lower reading as comparison evidence instead of implying we know which value is correct.
+    const priorBeforeLatest = accepted.length > 1 ? accepted[accepted.length - 2] : null;
+    suspectReading = {
+      sourceRow: priorAcceptedToLatest.sourceRow, recordNumber: priorAcceptedToLatest.recordNumber,
+      date: new Date(priorAcceptedToLatest.timestamp).toISOString().slice(0, 10), odometer: priorAcceptedToLatest.odo,
+      previousDate: priorBeforeLatest ? new Date(priorBeforeLatest.timestamp).toISOString().slice(0, 10) : null,
+      previousOdometer: priorBeforeLatest?.odo ?? null,
+      comparisonDate: new Date(latestSourceCandidate.timestamp).toISOString().slice(0, 10), comparisonOdometer: latestSourceCandidate.odo,
+      reason: "A later source reading is lower than this value. This may be an odometer jump in this row or an incorrect later reading; review both source records before deciding.",
+    };
+  }
+  // One reading per calendar day, using the last accepted reading on that day. Preserve the source row for diagnostics.
+  const byDay = new Map<string, { day: string; timestamp: number; odo: number; sourceRow: number; recordNumber: string | null }>();
   for (const row of accepted) {
     const day = new Date(row.timestamp).toISOString().slice(0, 10);
-    byDay.set(day, { day, timestamp: row.timestamp, odo: row.odo });
+    byDay.set(day, { day, timestamp: row.timestamp, odo: row.odo, sourceRow: row.sourceRow, recordNumber: row.recordNumber });
   }
   const daily = [...byDay.values()].sort((a, b) => a.day.localeCompare(b.day));
   if (!daily.length) return empty;
@@ -366,7 +385,10 @@ function estimateUsage(rows: Record<string, unknown>[], headers: string[], truck
       const upper = medianRate + Math.max(4.5 * 1.4826 * mad, 2.5 * medianRate, 1);
       if (rate > upper) {
         usageRateOutliers++;
-        if (i === daily.length - 1) suspiciousLatestReading = true;
+        if (i === daily.length - 1) {
+          suspiciousLatestReading = true;
+          suspectReading = { sourceRow: current.sourceRow, recordNumber: current.recordNumber, date: current.day, odometer: current.odo, previousDate: previous.day, previousOdometer: previous.odo, comparisonDate: null, comparisonOdometer: null, reason: `This reading implies ${Math.round(rate).toLocaleString()} km/day, above the robust usage-rate limit of ${Math.round(upper).toLocaleString()} km/day for this truck's recent history.` };
+        }
         continue;
       }
     }
@@ -387,6 +409,7 @@ function estimateUsage(rows: Record<string, unknown>[], headers: string[], truck
     validDailyReadings: acceptedDaily.length,
     usageRateOutliers,
     suspiciousLatestReading,
+    suspectReading,
   };
 }
 
@@ -574,7 +597,8 @@ export default function Dashboard() {
       const workbook = XLSX.read(buffer, { type: "array", cellDates: true });
       if (!workbook.SheetNames.length) throw new Error("The selected workbook has no worksheets.");
       const firstSheet = workbook.Sheets[workbook.SheetNames[0]];
-      const matrix = XLSX.utils.sheet_to_json<unknown[]>(firstSheet, { header: 1, defval: "", raw: true, blankrows: false });
+      // Preserve blank worksheet rows so diagnostics can report the actual Excel row number.
+      const matrix = XLSX.utils.sheet_to_json<unknown[]>(firstSheet, { header: 1, defval: "", raw: true, blankrows: true });
       if (matrix.length < 2) throw new Error("The first worksheet needs a header row and at least one data row.");
       const headers = (matrix[0] ?? []).map(value => String(value ?? "").trim());
       if (!headers.length || headers.length > 100) throw new Error("The worksheet must contain between 1 and 100 columns.");
@@ -582,8 +606,13 @@ export default function Dashboard() {
         throw new Error("The source has blank or duplicate column headers. Rename them so every column has a unique, non-empty header.");
       }
       const rows = matrix.slice(1)
-        .filter(cells => cells.some(value => String(value ?? "").trim() !== ""))
-        .map(cells => Object.fromEntries(headers.map((header, index) => [header, cells[index] ?? ""])) as Record<string, unknown>);
+        .map((cells, index) => {
+          const row = Object.fromEntries(headers.map((header, columnIndex) => [header, cells[columnIndex] ?? ""])) as Record<string, unknown>;
+          // Keep the original worksheet row for diagnostics without sending this helper field to the import API.
+          Object.defineProperty(row, "__sourceRow", { value: index + 2, enumerable: false, configurable: false });
+          return row;
+        })
+        .filter(row => headers.some(header => String(row[header] ?? "").trim() !== ""));
       if (!rows.length) throw new Error("The first worksheet has headers but no non-empty data rows.");
       if (rows.length > 10000) throw new Error("This version supports up to 10,000 rows per upload. Split the file and upload the parts separately.");
       clearMlComparison();
@@ -1053,7 +1082,7 @@ export default function Dashboard() {
                   <div><span>Estimated usage</span><strong>{liveUsage.averageKmPerDay === null ? "Not available" : `${Math.round(liveUsage.averageKmPerDay)} km/day`}</strong></div>
                   <div><span>Usage intervals</span><strong>{liveUsage.intervalsUsed}</strong></div>
                 </div>
-                <p className="prediction-method-note">Usage is the median of recent positive odometer increments per day. Decreasing readings and robustly detected usage-rate outliers are excluded, never corrected in the source. {liveUsage.usageRateOutliers} implausible interval(s) excluded for this truck.</p>{liveUsage.suspiciousLatestReading && <div className="import-message" role="alert"><AlertTriangle size={15} /><span>The latest source reading appears to be an implausible odometer jump. Forecasting is blocked until you review the source reading; the displayed odometer is the last accepted reading.</span></div>}
+                <p className="prediction-method-note">Usage is the median of recent positive odometer increments per day. Decreasing readings and robustly detected usage-rate outliers are excluded, never corrected in the source. {liveUsage.usageRateOutliers} implausible interval(s) excluded for this truck.</p>{liveUsage.suspiciousLatestReading && <div className="import-message" role="alert"><AlertTriangle size={15} /><span>The latest source sequence contains an implausible or decreasing odometer reading. Forecasting is blocked until you review the source values; the displayed odometer is the last accepted value under the current validation rules.</span></div>}{liveUsage.suspectReading && <div className="panel" style={{ marginTop: 12, padding: 16, border: "1px solid var(--border)" }} aria-label="Suspect odometer reading details"><div className="panel-header"><div><h3 style={{ margin: 0 }}>Suspect source reading</h3><p style={{ marginTop: 4 }}>Review this exact row in Data Quality before using the forecast.</p></div><FileText size={18} /></div><div className="audit-metric-grid"><div><span>Source row</span><strong>{liveUsage.suspectReading.sourceRow}</strong></div>{liveUsage.suspectReading.recordNumber && <div><span>Record number</span><strong>{liveUsage.suspectReading.recordNumber}</strong></div>}<div><span>Reading date</span><strong>{liveUsage.suspectReading.date}</strong></div><div><span>Suspect odometer</span><strong>{compact(liveUsage.suspectReading.odometer)} km</strong></div><div><span>Previous accepted date</span><strong>{liveUsage.suspectReading.previousDate ?? "—"}</strong></div><div><span>Previous accepted odometer</span><strong>{liveUsage.suspectReading.previousOdometer === null ? "—" : `${compact(liveUsage.suspectReading.previousOdometer)} km`}</strong></div>{liveUsage.suspectReading.comparisonDate && <div><span>Comparison reading date</span><strong>{liveUsage.suspectReading.comparisonDate}</strong></div>}{liveUsage.suspectReading.comparisonOdometer !== null && <div><span>Comparison odometer</span><strong>{compact(liveUsage.suspectReading.comparisonOdometer)} km</strong></div>}</div><p className="prediction-method-note" style={{ marginBottom: 12 }}>{liveUsage.suspectReading.reason}</p><button className="button secondary" type="button" onClick={() => setActive("data")}>Open Data Quality to review row <ArrowRight size={14} /></button></div>}
                 <div className="forecast-evidence-grid">
                   <div className="form-field"><label htmlFor="rule-source-reference">Approved PM-rule source reference</label><input id="rule-source-reference" value={ruleSourceReferenceInput} onChange={e => { setRuleSourceReferenceInput(e.target.value); setApprovalConfirmed(false); setForecastSaveMessage(""); }} maxLength={500} placeholder="OEM manual, approved maintenance procedure, document/page" /></div>
                   <div className="form-field"><label htmlFor="service-evidence-reference">Last-service evidence reference</label><input id="service-evidence-reference" value={serviceEvidenceReferenceInput} onChange={e => { setServiceEvidenceReferenceInput(e.target.value); setApprovalConfirmed(false); setForecastSaveMessage(""); }} maxLength={500} placeholder="Completed work order or verified service record" /></div>
